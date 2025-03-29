@@ -1,13 +1,14 @@
 # chat_repl.py
 import argparse
 import asyncio
-# Removed fcntl, pty, select, signal, struct, termios, tty, pyte (moved to terminal_manager)
+import termios  # For terminal mode restoration
 import getpass
 import llm_config
 import litellm
 import os
 import subprocess # Keep subprocess if needed elsewhere, otherwise remove
 import sys
+import termios  # For terminal mode management
 import traceback
 from datetime import datetime
 from typing import List, Tuple, Optional, Callable
@@ -274,6 +275,16 @@ class ChatApp:
     def __init__(self):
         self.state = AppState()
         self.loop = asyncio.get_event_loop()
+        self._original_termios = None  # Will store original terminal settings
+        self._ptk_running = False  # Track prompt_toolkit running state
+        # Initialize terminal manager and UI components
+        self._original_termios = None
+        if sys.platform != "win32" and sys.stdin.isatty():
+            try:
+                self._original_termios = termios.tcgetattr(sys.stdin.fileno())
+            except Exception as e:
+                print(f"Warning: Failed to save terminal settings: {e}")
+
         # Pass UI update callback and system message callback to managers
         self.chat_manager = ChatManager(self.state, self.loop, self.force_ui_update)
         # Pass the ChatManager's method as the callback for system messages
@@ -297,14 +308,28 @@ class ChatApp:
     def _suspend_ptk(self):
         """Temporarily suspends prompt_toolkit for raw input."""
         if self.pt_app and self.pt_app.is_running:
-            self.pt_app.exit(exception=EOFError)
+            self.pt_app.exit(exception=None)
             return True
         return False
 
     def _resume_ptk(self):
         """Resumes prompt_toolkit after raw input."""
         if not self.pt_app.is_running:
-            self.loop.create_task(self.pt_app.run_async())
+            try:
+                # Reinitialize PTK application if needed
+                if not self.pt_app.initialized:
+                    self.pt_app = self.ui_manager.get_application()
+                
+                # Reset terminal state before restarting
+                if sys.platform != "win32":
+                    sys.stdout.write("\x1b[?1049h\x1b[?25l")
+                    sys.stdout.flush()
+                
+                # Start PTK with error handling
+                self.loop.create_task(self.run_ptk_app())
+            except Exception as e:
+                print(f"Error resuming PTK: {e}")
+                traceback.print_exc()
 
     def handle_input(self, text: str):
         """Handles text submitted from the REPL input."""
@@ -317,12 +342,29 @@ class ChatApp:
             was_running = self._suspend_ptk()
             
             try:
+                # Fully reset terminal to normal state
+                self._restore_terminal()
+                
                 # Get new model configuration
                 config = llm_config.get_user_config()
+                
+                # Clear any remaining PTK artifacts
+                sys.stdout.write("\x1b[2J\x1b[H")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"Error during model configuration: {e}")
             finally:
                 # Always attempt to resume
                 if was_running:
-                    self._resume_ptk()
+                    try:
+                        self._resume_ptk()
+                        # Force immediate UI update
+                        self.force_ui_update()
+                        # Ensure focus is restored
+                    except Exception as e:
+                        print(f"Error resuming TUI: {e}")
+                        traceback.print_exc()
+                    self._refocus_input()
             if config is None:
                 self.chat_manager._add_message_to_history("system", "Model change cancelled")
                 return
@@ -414,16 +456,35 @@ class ChatApp:
                 print(f"DEBUG: Refocus failed (might be ok): {e}")
 
     def _restore_terminal(self):
-        """Manually try to restore terminal state after PTK exits."""
-        # This is primarily for Unix-like systems using VT100/ANSI escapes
-        if sys.platform != "win32":
-            try:
-                # Write ANSI codes to standard output
-                sys.stdout.write("\x1b[?1049l\x1b[?25h")  # Normal screen buffer + show cursor
+        """Manually restore terminal state after PTK exits."""
+        try:
+            if sys.platform != "win32" and sys.stdin.isatty():
+                # Unix: Switch back to main screen buffer and show cursor
+                sys.stdout.write("\x1b[?1049l\x1b[?25h")
                 sys.stdout.flush()
-                print("DEBUG: Sent ANSI codes to restore terminal.")
-            except Exception as e:
-                print(f"Warning: Failed to manually restore terminal state: {e}")
+                
+                # Restore original terminal settings if we saved them
+                if hasattr(self, '_original_termios') and self._original_termios:
+                    import termios
+                    termios.tcsetattr(
+                        sys.stdin.fileno(),
+                        termios.TCSADRAIN,
+                        self._original_termios
+                    )
+            elif sys.platform == "win32":
+                # Windows: Ensure cursor is visible
+                import ctypes
+                from ctypes import wintypes
+                kernel32 = ctypes.windll.kernel32
+                cursor_info = wintypes.CONSOLE_CURSOR_INFO()
+                cursor_info.bVisible = 1
+                cursor_info.dwSize = 25
+                kernel32.SetConsoleCursorInfo(
+                    kernel32.GetStdHandle(-11),
+                    ctypes.byref(cursor_info)
+                )
+        except Exception as e:
+            print(f"Warning: Terminal restoration failed: {e}")
 
     async def run_ptk_app(self):
         """Runs the prompt_toolkit application."""
@@ -513,6 +574,14 @@ class ChatApp:
 
     def run(self):
         """Synchronous entry point."""
+        # Save original terminal settings
+        if sys.platform != "win32" and sys.stdin.isatty():
+            try:
+                import termios
+                self._original_termios = termios.tcgetattr(sys.stdin.fileno())
+            except Exception as e:
+                print(f"Warning: Failed to save terminal settings: {e}")
+
         try:
             self.loop.run_until_complete(self.run_async())
         except Exception as e:
@@ -522,6 +591,8 @@ class ChatApp:
             # Ensure terminal session is stopped on exit
             if self.state.is_split:
                 self.terminal_manager.stop_session()
+            # Restore terminal state
+            self._restore_terminal()
             print("Application has exited.")
 
     def _initial_setup(self) -> bool:
