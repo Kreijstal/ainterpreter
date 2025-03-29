@@ -34,6 +34,16 @@ litellm.suppress_debug_info = True
 # --- Constants ---
 DEFAULT_TIMESTAMP_FORMAT = "%H:%M:%S"
 
+
+
+try:
+    import termios
+    import tty # tty might not be strictly needed if only using termios
+    HAS_TERMIOS = True
+except ImportError:
+    # This will skip termios saving/restoring on non-Unix systems like Windows
+    HAS_TERMIOS = False
+
 # --- State Class ---
 class AppState:
     """Holds the application's shared state."""
@@ -359,52 +369,104 @@ class ChatApp:
         print(f"DEBUG: Handling command: {command}")
 
         if command.lower() == "/model":
-            print("DEBUG: Starting model change process...")
-            # Suspend prompt_toolkit for clean input
-            #was_running = self._suspend_ptk()
-            
+            original_ptk_termios = None
+            fd = -1
+            is_tty = False
+
+            # --- Step 1: Save PTK's terminal state (if possible) ---
+            if HAS_TERMIOS and sys.stdin.isatty():
+                try:
+                    fd = sys.stdin.fileno()
+                    is_tty = True
+                    # Save the current attributes (PTK's raw/cbreak mode)
+                    original_ptk_termios = termios.tcgetattr(fd)
+                    print("DEBUG: Saved PTK termios settings.")
+                except termios.error as e:
+                    print(f"DEBUG: Could not get terminal attributes to save: {e}")
+                    is_tty = False # Can't proceed with termios restoration
+                except Exception as e:
+                     print(f"DEBUG: Non-termios error saving TTY state: {e}")
+                     is_tty = False
+
+
+            config = None
             try:
+                # --- Step 2: Restore "normal" terminal for input ---
                 print("DEBUG: Restoring terminal for config input...")
-                self._restore_terminal()
-                # Get new model configuration
-                config = llm_config.get_user_config()
+                self._restore_terminal() # Puts terminal into cooked mode
+
+                # --- Step 3: Get new model configuration ---
+                # Optional: Clear screen before standard input for cleaner look
+                os.system('cls' if os.name == 'nt' else 'clear')
+                print("--- Model Configuration ---")
+                config = llm_config.get_user_config() # Uses standard input/getpass
+                print("---------------------------")
+                # Optional: Short pause
+                # import time; time.sleep(0.5)
+
+
             except Exception as e:
                 print(f"DEBUG: Error during model config: {e}")
-                self.chat_manager._add_message_to_history("system", f"Model change failed: {e}")
-                config = None
+                # Add error message later, after terminal state is restored
+                self.loop.call_soon(
+                    self.chat_manager._add_message_to_history,
+                    "system", f"Model change failed: {e}"
+                )
+                config = None # Ensure config is None on error
+
             finally:
-                with open('debug.log', 'a') as f:
-                    f.write(f"HEY I AM RUNNING HERE\n")
-                self.ui_manager.pt_app.renderer.reset()     
-            
-                
-                # Always attempt to resume
-                #if was_running:
-                #    print("DEBUG: Attempting to resume PTK...")
-                #    try:
-                #        self._resume_ptk()
-                #    except Exception as e:
-                #        print(f"DEBUG: Failed to resume PTK: {e}")
-                #        self.chat_manager._add_message_to_history("system", "Failed to restore chat interface")
-                #        raise
+                print("DEBUG: Entering finally block for /model...")
+                # --- Step 4: Restore PTK's terminal state (if saved) ---
+                if is_tty and original_ptk_termios:
+                    try:
+                        print("DEBUG: Restoring PTK termios settings...")
+                        # Restore the raw/cbreak mode PTK was using
+                        # TCSADRAIN waits for output to drain before changing
+                        termios.tcsetattr(fd, termios.TCSADRAIN, original_ptk_termios)
+                        print("DEBUG: PTK termios settings restored.")
+                    except termios.error as e:
+                        print(f"DEBUG: CRITICAL: Failed to restore PTK termios settings: {e}")
+                        # The terminal might be left in a bad state here!
+                    except Exception as e:
+                         print(f"DEBUG: CRITICAL: Non-termios error restoring TTY state: {e}")
+
+                # --- Step 5: Reset PTK Rendering ---
+                if self.pt_app and self.pt_app.renderer:
+                    print("DEBUG: Resetting PTK renderer...")
+                    # Resetting renderer helps sync PTK's view of the screen
+                    self.pt_app.renderer.reset()
+                    # Invalidate forces a redraw on the next event loop tick
+                    self.pt_app.invalidate()
+                    print("DEBUG: PTK renderer reset and invalidated.")
+                else:
+                    print("DEBUG: PTK app or renderer not available for reset.")
+
+                # --- Re-focus input area (might help) ---
+                self.loop.call_soon(self._refocus_input)
+
+
+            # --- Process the config result (outside try/finally) ---
             if config is None:
-                self.chat_manager._add_message_to_history("system", "Model change cancelled")
-                return
-            
-            # Update state from the new config
-            self._update_state_from_config(config)
-            
-            # Confirm change, mentioning if key was updated in the config file
-            key_updated_msg = ""
-            if self.state.required_api_key_env_var and config.get(self.state.required_api_key_env_var):
-                key_updated_msg = " (API key saved in config)"
-            
-            self.chat_manager._add_message_to_history(
-                "system",
-                f"Model set to: {self.state.model_name}{key_updated_msg}"
-            )
-            # Also trigger a UI update to refresh the window title
-            self.force_ui_update()
+                # Error message added via loop.call_soon if exception occurred.
+                # Add cancellation message if no exception but config is still None.
+                 if 'e' not in locals(): # Check if an exception variable exists from the try block
+                    self.chat_manager._add_message_to_history("system", "Model change cancelled.")
+            else:
+                # Success! Process the config dictionary
+                self._update_state_from_config(config)
+
+                key_updated_msg = ""
+                # Check state *after* updating it
+                if self.state.required_api_key_env_var and self.state.api_key:
+                    # Indicate that the key is now set (either loaded or saved by get_user_config)
+                    key_updated_msg = f" (API key for {self.state.required_api_key_env_var} ready)"
+
+                self.chat_manager._add_message_to_history(
+                    "system",
+                    f"Model set to: {self.state.model_name}{key_updated_msg}"
+                )
+                # Force UI update might be needed if model name affects title etc.
+                self.force_ui_update()
             
         elif command.lower() == "/split":
             if not self.state.is_split:
