@@ -87,6 +87,8 @@ def get_user_config():
             required_env_var = "OPENROUTER_API_KEY"
         elif model_name.startswith("openai/") or model_name in ("gpt-4", "gpt-3.5-turbo"):
             required_env_var = "OPENAI_API_KEY"
+        elif model_name.startswith("deepseek/"):
+            required_env_var = "DEEPSEEK_API_KEY"
         # Add elif for other providers here if necessary
 
         if required_env_var:

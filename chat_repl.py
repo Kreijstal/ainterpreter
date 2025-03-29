@@ -298,7 +298,26 @@ class ChatApp:
         if not command:
             return
 
-        if command.lower() == "/split":
+        if command.lower() == "/model":
+            # Get new model configuration
+            config = llm_config.get_user_config()
+            if config is None:
+                self.chat_manager._add_message_to_history("system", "Model change cancelled")
+                return
+            
+            # Update model name
+            self.state.model_name = config.get("model")
+            self.chat_manager._add_message_to_history("system", f"Model changed to: {self.state.model_name}")
+            
+            # Update API key if needed
+            if config.get("OPENROUTER_API_KEY"):
+                os.environ["OPENROUTER_API_KEY"] = config["OPENROUTER_API_KEY"]
+                self.state.api_key = config["OPENROUTER_API_KEY"]
+            elif config.get("OPENAI_API_KEY"):
+                os.environ["OPENAI_API_KEY"] = config["OPENAI_API_KEY"]
+                self.state.api_key = config["OPENAI_API_KEY"]
+            
+        elif command.lower() == "/split":
             if not self.state.is_split:
                 self.state.is_split = True
                 self.terminal_manager.start_session()
