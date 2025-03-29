@@ -1,3 +1,4 @@
+# chat_repl.py
 import argparse
 import asyncio
 # Removed fcntl, pty, select, signal, struct, termios, tty, pyte (moved to terminal_manager)
@@ -7,6 +8,7 @@ import litellm
 import os
 import subprocess # Keep subprocess if needed elsewhere, otherwise remove
 import sys
+import traceback
 from datetime import datetime
 from typing import List, Tuple, Optional, Callable
 
@@ -292,6 +294,18 @@ class ChatApp:
         """Callback for managers to request UI redraw."""
         self.ui_manager.force_ui_update()
 
+    def _suspend_ptk(self):
+        """Temporarily suspends prompt_toolkit for raw input."""
+        if self.pt_app and self.pt_app.is_running:
+            self.pt_app.exit(exception=EOFError)
+            return True
+        return False
+
+    def _resume_ptk(self):
+        """Resumes prompt_toolkit after raw input."""
+        if not self.pt_app.is_running:
+            self.loop.create_task(self.pt_app.run_async())
+
     def handle_input(self, text: str):
         """Handles text submitted from the REPL input."""
         command = text.strip()
@@ -299,23 +313,34 @@ class ChatApp:
             return
 
         if command.lower() == "/model":
-            # Get new model configuration
-            config = llm_config.get_user_config()
+            # Suspend prompt_toolkit for clean input
+            was_running = self._suspend_ptk()
+            
+            try:
+                # Get new model configuration
+                config = llm_config.get_user_config()
+            finally:
+                # Always attempt to resume
+                if was_running:
+                    self._resume_ptk()
             if config is None:
                 self.chat_manager._add_message_to_history("system", "Model change cancelled")
                 return
             
-            # Update model name
-            self.state.model_name = config.get("model")
-            self.chat_manager._add_message_to_history("system", f"Model changed to: {self.state.model_name}")
+            # Update state from the new config
+            self._update_state_from_config(config)
             
-            # Update API key if needed
-            if config.get("OPENROUTER_API_KEY"):
-                os.environ["OPENROUTER_API_KEY"] = config["OPENROUTER_API_KEY"]
-                self.state.api_key = config["OPENROUTER_API_KEY"]
-            elif config.get("OPENAI_API_KEY"):
-                os.environ["OPENAI_API_KEY"] = config["OPENAI_API_KEY"]
-                self.state.api_key = config["OPENAI_API_KEY"]
+            # Confirm change, mentioning if key was updated in the config file
+            key_updated_msg = ""
+            if self.state.required_api_key_env_var and config.get(self.state.required_api_key_env_var):
+                key_updated_msg = " (API key saved in config)"
+            
+            self.chat_manager._add_message_to_history(
+                "system",
+                f"Model set to: {self.state.model_name}{key_updated_msg}"
+            )
+            # Also trigger a UI update to refresh the window title
+            self.force_ui_update()
             
         elif command.lower() == "/split":
             if not self.state.is_split:
@@ -380,16 +405,111 @@ class ChatApp:
             self.loop.call_later(0.01, self.force_ui_update)
             self.ui_manager.pt_app.renderer.reset() # Otherwise it looks ugly
 
+    def _refocus_input(self):
+        """Helper to focus the input area."""
+        if self.pt_app and self.pt_app.is_running and self.pt_app.layout:
+            try:
+                self.pt_app.layout.focus(self.ui_manager.repl_input_area)
+            except Exception as e:
+                print(f"DEBUG: Refocus failed (might be ok): {e}")
+
+    def _restore_terminal(self):
+        """Manually try to restore terminal state after PTK exits."""
+        # This is primarily for Unix-like systems using VT100/ANSI escapes
+        if sys.platform != "win32":
+            try:
+                # Write ANSI codes to standard output
+                sys.stdout.write("\x1b[?1049l\x1b[?25h")  # Normal screen buffer + show cursor
+                sys.stdout.flush()
+                print("DEBUG: Sent ANSI codes to restore terminal.")
+            except Exception as e:
+                print(f"Warning: Failed to manually restore terminal state: {e}")
+
+    async def run_ptk_app(self):
+        """Runs the prompt_toolkit application."""
+        self._ptk_running = True
+        exit_reason = None
+        print("DEBUG: Starting prompt_toolkit app...")
+        try:
+            # Ensure focus is set correctly when starting/resuming
+            self.loop.call_soon(self._refocus_input)
+            exit_reason = await self.pt_app.run_async()
+        except Exception as e:
+            print(f"\nError during prompt_toolkit execution: {e}", file=sys.stderr)
+            traceback.print_exc()
+            exit_reason = 'exit' # Treat errors as fatal
+        finally:
+            self._ptk_running = False
+            print(f"DEBUG: prompt_toolkit app finished with reason: {exit_reason}")
+            # Attempt terminal restoration AFTER ptk finishes
+            self._restore_terminal()
+        return exit_reason
+
     async def run_async(self):
-        """Runs the prompt_toolkit application asynchronously."""
-        # Perform initial setup (config, API key) before starting UI
+        """Main async loop managing the TUI lifecycle and suspension."""
+        print("Starting ChatREPL...")
         if not self._initial_setup():
-            return # Exit if setup fails
+            print("Initial setup failed. Exiting.", file=sys.stderr)
+            return
 
-        # Add initial message after setup
-        self.chat_manager._add_message_to_history("system", f"Chatting with {self.state.model_name}. /split, /unsplit, quit, exit. Ctrl+C/D to exit.")
+        self.chat_manager._add_message_to_history(
+            "system",
+            f"Chatting with {self.state.model_name or 'N/A'}. "
+            f"Commands: /model, /split, /unsplit, /type, /get_output, /get_full_output, /quit, /exit."
+        )
 
-        await self.pt_app.run_async()
+        # Main application loop
+        while True:
+            # Run the prompt_toolkit app
+            exit_reason = await self.run_ptk_app()
+
+            # --- Handle PTK Exit ---
+            if exit_reason == 'suspend':
+                print("DEBUG: TUI suspended for model change.")
+                # Clear screen before running config for cleaner display
+                os.system('cls' if os.name == 'nt' else 'clear')
+                new_config = None
+                try:
+                    # Run the blocking config function in executor
+                    new_config = await self.loop.run_in_executor(
+                        None, llm_config.get_user_config
+                    )
+                except Exception as e:
+                    print(f"\nError during model configuration task: {e}", file=sys.stderr)
+                    traceback.print_exc()
+                    # Add error to history when TUI resumes
+                    self.loop.call_soon(
+                         self.chat_manager._add_error_to_history,
+                         f"Failed processing model change: {e}"
+                    )
+
+                # Process the config result whether it succeeded or not
+                if new_config is None:
+                     self.loop.call_soon(
+                         self.chat_manager._add_message_to_history,
+                         "system", "Model change cancelled or failed."
+                     )
+                else:
+                     self._update_state_from_config(new_config)
+                     key_updated_msg = (" (API key saved)" if self.state.required_api_key_env_var and new_config.get(self.state.required_api_key_env_var) else "")
+                     self.loop.call_soon(
+                         self.chat_manager._add_message_to_history,
+                         "system", f"Model set to: {self.state.model_name}{key_updated_msg}"
+                     )
+
+                # TUI will restart on the next loop iteration
+                print("\nConfiguration finished, resuming TUI...")
+                await asyncio.sleep(0.5) # Brief pause before TUI restarts
+
+            elif exit_reason == 'exit':
+                print("DEBUG: Exit requested.")
+                break # Exit the main while loop
+            else:
+                # Unexpected exit reason or None (e.g., error during ptk run)
+                print(f"DEBUG: TUI exited unexpectedly (reason: {exit_reason}). Stopping.")
+                break # Exit the main while loop
+
+        print("DEBUG: Exited main application loop.")
 
     def run(self):
         """Synchronous entry point."""
@@ -445,6 +565,50 @@ class ChatApp:
             print("No specific API key needed based on model name prefix.")
 
         return True
+
+    def _update_state_from_config(self, config: Optional[dict]):
+        """Updates app state based on a config dict (from load or get_user_config)."""
+        if not config or not isinstance(config, dict):
+             print("Debug: Invalid config passed to _update_state_from_config")
+             return
+
+        self.state.model_name = config.get("model")
+        # Reset API key state
+        self.state.api_key = None
+        self.state.required_api_key_env_var = None
+
+        # Determine required key based on the new model name
+        if self.state.model_name:
+            # Use case-insensitive matching for robustness
+            model_lower = self.state.model_name.lower()
+            if model_lower.startswith("openrouter/"): self.state.required_api_key_env_var = "OPENROUTER_API_KEY"
+            elif model_lower.startswith("openai/") or model_lower in ("gpt-4", "gpt-3.5-turbo"): self.state.required_api_key_env_var = "OPENAI_API_KEY"
+            elif model_lower.startswith("deepseek/"): self.state.required_api_key_env_var = "DEEPSEEK_API_KEY"
+            elif model_lower.startswith("anthropic/"): self.state.required_api_key_env_var = "ANTHROPIC_API_KEY"
+            elif model_lower.startswith("groq/"): self.state.required_api_key_env_var = "GROQ_API_KEY"
+            # Add other providers...
+
+        # If a key is potentially required, try to load it into state
+        if self.state.required_api_key_env_var:
+             # Priority: 1. Key in the passed config dict, 2. Environment variable
+             key_from_config = config.get(self.state.required_api_key_env_var)
+             key_from_env = os.getenv(self.state.required_api_key_env_var)
+
+             if key_from_config:
+                 self.state.api_key = key_from_config
+                 # Ensure environment is also set if config provided the key
+                 os.environ[self.state.required_api_key_env_var] = key_from_config
+                 print(f"DEBUG: Loaded API key ({self.state.required_api_key_env_var}) from config.")
+             elif key_from_env:
+                 self.state.api_key = key_from_env
+                 print(f"DEBUG: Loaded API key ({self.state.required_api_key_env_var}) from environment.")
+             else:
+                  print(f"DEBUG: Required API key ({self.state.required_api_key_env_var}) not found in config or environment.")
+                  # API key remains None in state
+
+        # Ensure the UI title reflects the new model name immediately if PTK is running
+        if self._ptk_running:
+             self.force_ui_update()
 
     def _get_api_key_interactive(self, config, required_env_var):
         """Gets API key interactively (used during initial setup)."""
