@@ -297,32 +297,96 @@ class ChatApp:
     def _suspend_ptk(self):
         """Temporarily suspends prompt_toolkit for raw input."""
         if self.pt_app and self.pt_app.is_running:
-            self.pt_app.exit(exception=EOFError)
-            return True
+            print("DEBUG: Suspending PTK application...")
+            try:
+                # Use a custom exception instead of EOFError
+                class PTKSuspend(Exception): pass
+                print("DEBUG: Creating PTK exit request...")
+                self.pt_app.exit(exception=PTKSuspend())
+                print("DEBUG: PTK suspended successfully with custom exception")
+                print(f"DEBUG: PTK running state after suspend: {self.pt_app.is_running}")
+                return True
+            except Exception as e:
+                print(f"DEBUG: Suspend failed: {e}")
+                return False
+        print("DEBUG: PTK not running, nothing to suspend")
         return False
 
     def _resume_ptk(self):
         """Resumes prompt_toolkit after raw input."""
+        print(f"DEBUG: Checking PTK state before resume - running: {self.pt_app.is_running}")
         if not self.pt_app.is_running:
-            self.loop.create_task(self.pt_app.run_async())
+            print("DEBUG: Resuming PTK application...")
+            print(f"DEBUG: Checking for pending exits - exit_requested: {getattr(self.pt_app, '_exit_requested', False)}")
+            try:
+                # Clear any pending exit requests
+                if hasattr(self.pt_app, '_exit_requested'):
+                    self.pt_app._exit_requested = False
+                
+                # Create fresh UI components and application instance
+                self.ui_manager = UIManager(self, self.state, self.handle_input, self.handle_key_press)
+                self.pt_app = self.ui_manager.get_application()
+                print(f"DEBUG: Created new PTK instance - running: {self.pt_app.is_running}")
+                
+                # Reset all state first
+                self.loop.call_soon(self._refocus_input)
+                self.force_ui_update()
+                
+                # Schedule the async run with error handling
+                async def safe_run():
+                    try:
+                        await self.pt_app.run_async()
+                    except Exception as e:
+                        print(f"DEBUG: PTK run error: {e}")
+                        # Attempt recovery
+                        self.loop.call_soon(self._resume_ptk)
+                
+                self.loop.create_task(safe_run())
+                print("DEBUG: PTK resumed with fresh instance and clean state")
+                
+            except Exception as e:
+                print(f"DEBUG: Resume failed: {e}")
+                # Final attempt with delay
+                self.loop.call_later(0.2, self._resume_ptk)
+                print("DEBUG: Scheduled retry after delay")
 
     def handle_input(self, text: str):
         """Handles text submitted from the REPL input."""
         command = text.strip()
         if not command:
             return
+            
+        print(f"DEBUG: Handling command: {command}")
 
         if command.lower() == "/model":
+            print("DEBUG: Starting model change process...")
             # Suspend prompt_toolkit for clean input
-            was_running = self._suspend_ptk()
+            #was_running = self._suspend_ptk()
             
             try:
+                print("DEBUG: Restoring terminal for config input...")
+                self._restore_terminal()
                 # Get new model configuration
                 config = llm_config.get_user_config()
+            except Exception as e:
+                print(f"DEBUG: Error during model config: {e}")
+                self.chat_manager._add_message_to_history("system", f"Model change failed: {e}")
+                config = None
             finally:
+                with open('debug.log', 'a') as f:
+                    f.write(f"HEY I AM RUNNING HERE\n")
+                self.ui_manager.pt_app.renderer.reset()     
+            
+                
                 # Always attempt to resume
-                if was_running:
-                    self._resume_ptk()
+                #if was_running:
+                #    print("DEBUG: Attempting to resume PTK...")
+                #    try:
+                #        self._resume_ptk()
+                #    except Exception as e:
+                #        print(f"DEBUG: Failed to resume PTK: {e}")
+                #        self.chat_manager._add_message_to_history("system", "Failed to restore chat interface")
+                #        raise
             if config is None:
                 self.chat_manager._add_message_to_history("system", "Model change cancelled")
                 return
@@ -414,22 +478,43 @@ class ChatApp:
                 print(f"DEBUG: Refocus failed (might be ok): {e}")
 
     def _restore_terminal(self):
-        """Manually try to restore terminal state after PTK exits."""
-        # This is primarily for Unix-like systems using VT100/ANSI escapes
-        if sys.platform != "win32":
-            try:
-                # Write ANSI codes to standard output
-                sys.stdout.write("\x1b[?1049l\x1b[?25h")  # Normal screen buffer + show cursor
+        """Manually restore terminal state after PTK exits."""
+        try:
+            if sys.platform != "win32" and sys.stdin.isatty():
+                # Unix: Switch back to main screen buffer and show cursor
+                sys.stdout.write("\x1b[?1049l\x1b[?25h")
                 sys.stdout.flush()
-                print("DEBUG: Sent ANSI codes to restore terminal.")
-            except Exception as e:
-                print(f"Warning: Failed to manually restore terminal state: {e}")
+                
+                # Restore original terminal settings if we saved them
+                if hasattr(self, '_original_termios') and self._original_termios:
+                    import termios
+                    termios.tcsetattr(
+                        sys.stdin.fileno(),
+                        termios.TCSADRAIN,
+                        self._original_termios
+                    )
+            elif sys.platform == "win32":
+                # Windows: Ensure cursor is visible
+                import ctypes
+                from ctypes import wintypes
+                kernel32 = ctypes.windll.kernel32
+                cursor_info = wintypes.CONSOLE_CURSOR_INFO()
+                cursor_info.bVisible = 1
+                cursor_info.dwSize = 25
+                kernel32.SetConsoleCursorInfo(
+                    kernel32.GetStdHandle(-11),
+                    ctypes.byref(cursor_info)
+                )
+        except Exception as e:
+            print(f"Warning: Terminal restoration failed: {e}")
 
     async def run_ptk_app(self):
         """Runs the prompt_toolkit application."""
         self._ptk_running = True
         exit_reason = None
-        print("DEBUG: Starting prompt_toolkit app...")
+        
+        print(f"DEBUG: PTK State - running: {self.pt_app.is_running}, exit_requested: {getattr(self.pt_app, '_exit_requested', False)}")
+        print(f"DEBUG: App State - model: {self.state.model_name}, split: {self.state.is_split}")
         try:
             # Ensure focus is set correctly when starting/resuming
             self.loop.call_soon(self._refocus_input)
@@ -437,6 +522,7 @@ class ChatApp:
         except Exception as e:
             print(f"\nError during prompt_toolkit execution: {e}", file=sys.stderr)
             traceback.print_exc()
+            print("THERE IS AN ERROR AND THAT IS WHY WE EXIT HERE")
             exit_reason = 'exit' # Treat errors as fatal
         finally:
             self._ptk_running = False
@@ -513,6 +599,13 @@ class ChatApp:
 
     def run(self):
         """Synchronous entry point."""
+        # Save original terminal settings
+        if sys.platform != "win32" and sys.stdin.isatty():
+            try:
+                import termios
+                self._original_termios = termios.tcgetattr(sys.stdin.fileno())
+            except Exception as e:
+                print(f"Warning: Failed to save terminal settings: {e}")
         try:
             self.loop.run_until_complete(self.run_async())
         except Exception as e:
