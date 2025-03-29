@@ -397,7 +397,9 @@ class ChatApp:
         print("Loading configuration...")
         config = llm_config.load_config()
         if config is None:
-            print("Error: Configuration file 'llm_config.json' not found or invalid.")
+            config = llm_config.get_user_config()
+            if config is None:
+                return False
             print("Please ensure 'llm_config.json' is present and configured.")
             return False
 
