@@ -56,6 +56,7 @@ class AppState:
         self.chat_history: FormattedText = FormattedText([])
         # Removed self.terminal_output as TerminalManager now manages its display
         self.chat_messages_for_api: List[dict] = [] # History for LiteLLM
+        self.debug_mode: bool = False # Controls debug print output
 
 # --- Manager Classes ---
 
@@ -307,27 +308,34 @@ class ChatApp:
     def _suspend_ptk(self):
         """Temporarily suspends prompt_toolkit for raw input."""
         if self.pt_app and self.pt_app.is_running:
-            print("DEBUG: Suspending PTK application...")
+            if self.state.debug_mode:
+                print("DEBUG: Suspending PTK application...")
             try:
                 # Use a custom exception instead of EOFError
                 class PTKSuspend(Exception): pass
-                print("DEBUG: Creating PTK exit request...")
+                if self.state.debug_mode:
+                    print("DEBUG: Creating PTK exit request...")
                 self.pt_app.exit(exception=PTKSuspend())
-                print("DEBUG: PTK suspended successfully with custom exception")
-                print(f"DEBUG: PTK running state after suspend: {self.pt_app.is_running}")
+                if self.state.debug_mode:
+                    print("DEBUG: PTK suspended successfully with custom exception")
+                    print(f"DEBUG: PTK running state after suspend: {self.pt_app.is_running}")
                 return True
             except Exception as e:
-                print(f"DEBUG: Suspend failed: {e}")
+                if self.state.debug_mode:
+                    print(f"DEBUG: Suspend failed: {e}")
                 return False
-        print("DEBUG: PTK not running, nothing to suspend")
+        if self.state.debug_mode:
+            print("DEBUG: PTK not running, nothing to suspend")
         return False
 
     def _resume_ptk(self):
         """Resumes prompt_toolkit after raw input."""
-        print(f"DEBUG: Checking PTK state before resume - running: {self.pt_app.is_running}")
+        if self.state.debug_mode:
+            print(f"DEBUG: Checking PTK state before resume - running: {self.pt_app.is_running}")
         if not self.pt_app.is_running:
-            print("DEBUG: Resuming PTK application...")
-            print(f"DEBUG: Checking for pending exits - exit_requested: {getattr(self.pt_app, '_exit_requested', False)}")
+            if self.state.debug_mode:
+                print("DEBUG: Resuming PTK application...")
+                print(f"DEBUG: Checking for pending exits - exit_requested: {getattr(self.pt_app, '_exit_requested', False)}")
             try:
                 # Clear any pending exit requests
                 if hasattr(self.pt_app, '_exit_requested'):
@@ -336,7 +344,8 @@ class ChatApp:
                 # Create fresh UI components and application instance
                 self.ui_manager = UIManager(self, self.state, self.handle_input, self.handle_key_press)
                 self.pt_app = self.ui_manager.get_application()
-                print(f"DEBUG: Created new PTK instance - running: {self.pt_app.is_running}")
+                if self.state.debug_mode:
+                    print(f"DEBUG: Created new PTK instance - running: {self.pt_app.is_running}")
                 
                 # Reset all state first
                 self.loop.call_soon(self._refocus_input)
@@ -347,18 +356,22 @@ class ChatApp:
                     try:
                         await self.pt_app.run_async()
                     except Exception as e:
-                        print(f"DEBUG: PTK run error: {e}")
+                        if self.state.debug_mode:
+                            print(f"DEBUG: PTK run error: {e}")
                         # Attempt recovery
                         self.loop.call_soon(self._resume_ptk)
                 
                 self.loop.create_task(safe_run())
-                print("DEBUG: PTK resumed with fresh instance and clean state")
+                if self.state.debug_mode:
+                    print("DEBUG: PTK resumed with fresh instance and clean state")
                 
             except Exception as e:
-                print(f"DEBUG: Resume failed: {e}")
+                if self.state.debug_mode:
+                    print(f"DEBUG: Resume failed: {e}")
                 # Final attempt with delay
                 self.loop.call_later(0.2, self._resume_ptk)
-                print("DEBUG: Scheduled retry after delay")
+                if self.state.debug_mode:
+                    print("DEBUG: Scheduled retry after delay")
 
     def handle_input(self, text: str):
         """Handles text submitted from the REPL input."""
@@ -366,7 +379,8 @@ class ChatApp:
         if not command:
             return
             
-        print(f"DEBUG: Handling command: {command}")
+        if self.state.debug_mode:
+            print(f"DEBUG: Handling command: {command}")
 
         if command.lower() == "/model":
             original_ptk_termios = None
@@ -380,13 +394,16 @@ class ChatApp:
                     is_tty = True
                     # Save the current attributes (PTK's raw/cbreak mode)
                     original_ptk_termios = termios.tcgetattr(fd)
-                    print("DEBUG: Saved PTK termios settings.")
+                    if self.state.debug_mode:
+                        print("DEBUG: Saved PTK termios settings.")
                 except termios.error as e:
-                    print(f"DEBUG: Could not get terminal attributes to save: {e}")
+                    if self.state.debug_mode:
+                        print(f"DEBUG: Could not get terminal attributes to save: {e}")
                     is_tty = False # Can't proceed with termios restoration
                 except Exception as e:
-                     print(f"DEBUG: Non-termios error saving TTY state: {e}")
-                     is_tty = False
+                    if self.state.debug_mode:
+                        print(f"DEBUG: Non-termios error saving TTY state: {e}")
+                    is_tty = False
 
 
             config = None
@@ -415,31 +432,39 @@ class ChatApp:
                 config = None # Ensure config is None on error
 
             finally:
-                print("DEBUG: Entering finally block for /model...")
+                if self.state.debug_mode:
+                    print("DEBUG: Entering finally block for /model...")
                 # --- Step 4: Restore PTK's terminal state (if saved) ---
                 if is_tty and original_ptk_termios:
                     try:
-                        print("DEBUG: Restoring PTK termios settings...")
+                        if self.state.debug_mode:
+                            print("DEBUG: Restoring PTK termios settings...")
                         # Restore the raw/cbreak mode PTK was using
                         # TCSADRAIN waits for output to drain before changing
                         termios.tcsetattr(fd, termios.TCSADRAIN, original_ptk_termios)
-                        print("DEBUG: PTK termios settings restored.")
+                        if self.state.debug_mode:
+                            print("DEBUG: PTK termios settings restored.")
                     except termios.error as e:
-                        print(f"DEBUG: CRITICAL: Failed to restore PTK termios settings: {e}")
+                        if self.state.debug_mode:
+                            print(f"DEBUG: CRITICAL: Failed to restore PTK termios settings: {e}")
                         # The terminal might be left in a bad state here!
                     except Exception as e:
-                         print(f"DEBUG: CRITICAL: Non-termios error restoring TTY state: {e}")
+                        if self.state.debug_mode:
+                            print(f"DEBUG: CRITICAL: Non-termios error restoring TTY state: {e}")
 
                 # --- Step 5: Reset PTK Rendering ---
                 if self.pt_app and self.pt_app.renderer:
-                    print("DEBUG: Resetting PTK renderer...")
+                    if self.state.debug_mode:
+                        print("DEBUG: Resetting PTK renderer...")
                     # Resetting renderer helps sync PTK's view of the screen
                     self.pt_app.renderer.reset()
                     # Invalidate forces a redraw on the next event loop tick
                     self.pt_app.invalidate()
-                    print("DEBUG: PTK renderer reset and invalidated.")
+                    if self.state.debug_mode:
+                        print("DEBUG: PTK renderer reset and invalidated.")
                 else:
-                    print("DEBUG: PTK app or renderer not available for reset.")
+                    if self.state.debug_mode:
+                        print("DEBUG: PTK app or renderer not available for reset.")
 
                 # --- Re-focus input area (might help) ---
                 self.loop.call_soon(self._refocus_input)
@@ -575,8 +600,9 @@ class ChatApp:
         self._ptk_running = True
         exit_reason = None
         
-        print(f"DEBUG: PTK State - running: {self.pt_app.is_running}, exit_requested: {getattr(self.pt_app, '_exit_requested', False)}")
-        print(f"DEBUG: App State - model: {self.state.model_name}, split: {self.state.is_split}")
+        if self.state.debug_mode:
+            print(f"DEBUG: PTK State - running: {self.pt_app.is_running}, exit_requested: {getattr(self.pt_app, '_exit_requested', False)}")
+            print(f"DEBUG: App State - model: {self.state.model_name}, split: {self.state.is_split}")
         try:
             # Ensure focus is set correctly when starting/resuming
             self.loop.call_soon(self._refocus_input)
@@ -588,7 +614,8 @@ class ChatApp:
             exit_reason = 'exit' # Treat errors as fatal
         finally:
             self._ptk_running = False
-            print(f"DEBUG: prompt_toolkit app finished with reason: {exit_reason}")
+            if self.state.debug_mode:
+                print(f"DEBUG: prompt_toolkit app finished with reason: {exit_reason}")
             # Attempt terminal restoration AFTER ptk finishes
             self._restore_terminal()
         return exit_reason
@@ -650,14 +677,17 @@ class ChatApp:
                 await asyncio.sleep(0.5) # Brief pause before TUI restarts
 
             elif exit_reason == 'exit':
-                print("DEBUG: Exit requested.")
+                if self.state.debug_mode:
+                    print("DEBUG: Exit requested.")
                 break # Exit the main while loop
             else:
                 # Unexpected exit reason or None (e.g., error during ptk run)
-                print(f"DEBUG: TUI exited unexpectedly (reason: {exit_reason}). Stopping.")
+                if self.state.debug_mode:
+                    print(f"DEBUG: TUI exited unexpectedly (reason: {exit_reason}). Stopping.")
                 break # Exit the main while loop
 
-        print("DEBUG: Exited main application loop.")
+        if self.state.debug_mode:
+            print("DEBUG: Exited main application loop.")
 
     def run(self):
         """Synchronous entry point."""
